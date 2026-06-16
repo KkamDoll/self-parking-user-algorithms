@@ -164,23 +164,40 @@ def hybrid_astar_plan(static_map, start_state, goal):  # [D] placeholder
 #     D 오케스트레이션(_compute_control_D)이 담당하고 여기서는 조향만 계산한다.
 #     반환값 클램프(-MAX_STEER~+MAX_STEER)는 호출부(_compute_control_D)에서 수행.
 def pure_pursuit_steer(state, path, idx, direction) -> float:  # [C] 구현
-    x = float(state.get("x", 0.0))
+    '''
+    목표점(look-ahead point) 를 향해 가는 방법
+    
+    Pure Pursuit 조향각 계산.
+
+    공식: delta = atan2(2 * L * sin(alpha), L_d)
+    - delta : 조향각        - L   : 차량 축간거리(Wheelbase)
+    - L_d   : 전방주시거리   - alpha : 헤딩과 목표점 사이 사잇각
+
+    기하 유도:
+    1) 곡률 kappa = 1/R = 2*sin(alpha)/L_d
+    2) 자전거 모델 tan(delta) = L/R = L*kappa
+    3) delta = atan(L*kappa)
+    '''
+
+    x = float(state.get("x", 0.0))           # 현재 차 위치 
     y = float(state.get("y", 0.0))
-    yaw = float(state.get("yaw", 0.0))
+    yaw = float(state.get("yaw", 0.0))       # 현재 차 방향
 
     tx, ty = _wp_xy(path[idx])               # [D] 헬퍼 재사용 (객체/튜플 모두 지원)
-    dx, dy = tx - x, ty - y
-    dist = math.hypot(dx, dy)
+                                             # 따라갈 목표의 웨이포인트
 
-    # 차량 좌표계로 변환 (전방 +x, 좌측 +y)
-    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
-    local_x = dx * cos_yaw + dy * sin_yaw
-    local_y = -dx * sin_yaw + dy * cos_yaw
+    dx, dy = tx - x, ty - y                  # 목표까지의 벡터
+    dist = math.hypot(dx, dy)                # 목표까지의 거리 = L_d
 
-    if direction < 0:
-        # 후진: 목표를 후축 뒤쪽에서 바라보고 계산한 뒤 조향을 반전
-        alpha = math.atan2(-local_y, -local_x)
-        return -math.atan2(2.0 * P_L * math.sin(alpha), max(dist, 1e-3))
+    """차량 좌표계로 변환 (전방 +x, 좌측 +y) + 목표점까지의 방향과 거리를 구함"""
+    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)    
+    local_x = dx * cos_yaw + dy * sin_yaw    # 차 기준 전방 성분
+    local_y = -dx * sin_yaw + dy * cos_yaw   # 차 기준 좌측 성분
+
+    if direction < 0:       
+    # 후진: 목표를 후축 뒤쪽에서 바라보고 계산한 뒤 조향을 반전
+        alpha = math.atan2(-local_y, -local_x)                              # 각도 오차 α
+        return -math.atan2(2.0 * P_L * math.sin(alpha), max(dist, 1e-3))    # 조향각 δ
 
     # 전진: Pure Pursuit  steer = atan2(2*L*sin(alpha), Ld)
     alpha = math.atan2(local_y, local_x)
@@ -293,6 +310,7 @@ class PlannerSkeleton:
         # (e) 조향은 Pure Pursuit [C], 속도는 D 가 페달로
         steer = pure_pursuit_steer(state, self.path, self.idx, direction)  # [C] 조향각
         steer = _clamp(steer, -MAX_STEER, MAX_STEER)                       # 목표속도와 현재속도 차이로 페달 계산
+                                                                           # 한계값(MAX_STEER)로 자름
         accel, brake = speed_to_pedal(state.get("v", 0.0), v_tgt, direction)
         return {"steer": steer, "accel": accel, "brake": brake, "gear": gear}
 
