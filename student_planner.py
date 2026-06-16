@@ -43,10 +43,12 @@ PARAMS = {
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:  # [D]
+    """ 값을 [lo, hi] 범위로 자르기 """
     return max(lo, min(hi, x))
 
 
-def _wrap_to_pi(a: float) -> float:  # [D]
+def _wrap_to_pi(a: float) -> float:  # [D]  --> -pi ~ +pi 로 정규화
+    """ 각도를 정규화 (각도 오차 비교용) """
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
@@ -55,6 +57,7 @@ def select_goal_pose(slot, expected_orientation: str):  # [D]
 
     시뮬 determine_parking_orientation() 기준 (세로 슬롯이면 sin(yaw) 부호):
       front_in -> yaw=+90deg, rear_in -> yaw=-90deg
+
     """
     xmin, xmax, ymin, ymax = slot
     cx = 0.5 * (xmin + xmax)
@@ -72,11 +75,13 @@ def select_goal_pose(slot, expected_orientation: str):  # [D]
     return (gx, gy, goal_yaw)
 
 
-def gear_for_direction(direction: int) -> str:  # [D]
-    return "D" if direction >= 0 else "R"
+def gear_for_direction(direction: int) -> str:  # [D] --> 전진 후진 기어
+    return "D" if direction >= 0 else "R"       # +면 "D", -면 "R"
 
 
 def target_speed(dist_to_goal: float, dist_to_cusp: float, phase: str) -> float:  # [D]
+    """거리 기반 목표 속도 (감속 프로파일)"""
+
     if phase == "STOP":
         return 0.0
     v = PARAMS["v_cruise"]
@@ -86,7 +91,9 @@ def target_speed(dist_to_goal: float, dist_to_cusp: float, phase: str) -> float:
 
 
 def speed_to_pedal(v: float, v_tgt: float, direction: int):  # [D]
-    """기어가 방향을 결정한다고 가정. ※ 시뮬 gear 처리 확인 후 부호 검증 필요."""
+    """기어가 방향을 결정한다고 가정. ※ 시뮬 gear 처리 확인 후 부호 검증 필요.
+        속도 오차 -> accel/brake (P제어)"""
+
     v_along = direction * v
     err = v_tgt - v_along
     if err > 0:
@@ -95,6 +102,8 @@ def speed_to_pedal(v: float, v_tgt: float, direction: int):  # [D]
 
 
 def reached_goal(state: Dict[str, Any], goal) -> bool:  # [D]
+    """위치 + 방향 둘다 허용 오차 안이면 True"""
+
     dist = math.hypot(state["x"] - goal[0], state["y"] - goal[1])
     yaw_err = abs(_wrap_to_pi(state["yaw"] - goal[2]))
     return dist < PARAMS["pos_tol"] and yaw_err < PARAMS["yaw_tol"]
@@ -228,18 +237,18 @@ class PlannerSkeleton:
         if "x" not in state:
             return None  # state 없으면 원본 데모로 fallback
 
-        # (a) 최초 1회: 목표 pose 정하고 Hybrid A* 호출 [B]
-        if self.path is None:
-            slot = obs.get("target_slot")
+        # (a) 최초 1회: 목표 pose 정하고 Hybrid A* 호출 [connect to 민호(B)]
+        if self.path is None:                   # 아직 경로가 없으면
+            slot = obs.get("target_slot")       # 목표 주차 슬롯
             if slot is None:
                 return None
-            self.goal = select_goal_pose(slot, self.expected_orientation)
-            self.path = hybrid_astar_plan(self.map_data, state, self.goal)  # [B]
+            self.goal = select_goal_pose(slot, self.expected_orientation)   # 목표 위치 + 방향 계산
+            self.path = hybrid_astar_plan(self.map_data, state, self.goal)  # [B] 호출해서 경로 받기
             self.idx = 0
             self.phase = "DRIVE"
 
         # (fallback) 경로가 비었으면(B 미완성) 안전 정지
-        if not self.path:
+        if not self.path:       # B가 미구현이라 [] 반환 -> 여기서 코드 ㄱ걸림
             return {"steer": 0.0, "accel": 0.0, "brake": 0.3, "gear": "D"}
 
         # (b) 정차 단계면 계속 브레이크
@@ -248,18 +257,18 @@ class PlannerSkeleton:
             return {"steer": 0.0, "accel": 0.0, "brake": 1.0, "gear": "D"}
 
         # (c) 경로 진행 + 현재 세그먼트 방향/기어
-        self.idx = advance_index(self.path, state, self.idx)
-        direction = _wp_dir(self.path[self.idx])
-        gear = gear_for_direction(direction)
+        self.idx = advance_index(self.path, state, self.idx)    # 가까워진 웨이포인트는 통과
+        direction = _wp_dir(self.path[self.idx])                # 이 구간이 전진(+1) / 후진(-1)
+        gear = gear_for_direction(direction)                    # D or R
 
         # (d) 속도 프로파일 (컵스/골 감속)
-        d_goal = dist_to_goal(state, self.path[-1])
-        d_cusp = dist_to_next_cusp(self.path, self.idx)
-        v_tgt = target_speed(d_goal, d_cusp, self.phase)
+        d_goal = dist_to_goal(state, self.path[-1])             # 골까지 거리
+        d_cusp = dist_to_next_cusp(self.path, self.idx)         # 다음 전후진 전환점(cusp)까지 거리
+        v_tgt = target_speed(d_goal, d_cusp, self.phase)        # 목표 속도 = 둘 중 더 빡센 감속 적용
 
         # (e) 조향은 Pure Pursuit [C], 속도는 D 가 페달로
-        steer = pure_pursuit_steer(state, self.path, self.idx, direction)  # [C]
-        steer = _clamp(steer, -MAX_STEER, MAX_STEER)
+        steer = pure_pursuit_steer(state, self.path, self.idx, direction)  # [C] 조향각
+        steer = _clamp(steer, -MAX_STEER, MAX_STEER)                       # 목표속도와 현재속도 차이로 페달 계산
         accel, brake = speed_to_pedal(state.get("v", 0.0), v_tgt, direction)
         return {"steer": steer, "accel": accel, "brake": brake, "gear": gear}
 
