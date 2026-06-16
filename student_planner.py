@@ -16,6 +16,7 @@ B(Hybrid A*) / C(Pure Pursuit) 자리는 TODO 로 비워둠 -> 비어 있어도 
 """
 
 import math  # [D] 추가
+import heapq  # [B]
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -152,10 +153,167 @@ def dist_to_goal(state, goal_wp) -> float:  # [D]
     return math.hypot(state["x"] - gx, state["y"] - gy)
 
 
+# ===========================================================================
+# [B] 추가 영역 시작 — Hybrid A* 상수 / 탐색 노드
+# ===========================================================================
+_B_VEH_WIDTH = 2.0                               # [B] 차량 폭 (m)
+_B_STEP = 0.5                                    # [B] 탐색 호 길이 (m)
+_B_STEER_LIST = [                                # [B] 이산화된 조향각 목록
+    -MAX_STEER, -MAX_STEER * 0.5, 0.0, MAX_STEER * 0.5, MAX_STEER
+]
+_B_XY_RES = 0.5                                  # [B] 위치 이산화 해상도 (m)
+_B_YAW_RES = math.radians(5)                     # [B] 방향 이산화 해상도 (5도)
+_B_N_YAW = int(round(2 * math.pi / _B_YAW_RES)) # [B] yaw bin 수 (72)
+_B_REVERSE_COST = 2.0                            # [B] 후진 비용 배율
+_B_CUSP_COST = 3.0                               # [B] 전/후진 전환 추가 비용
+_B_MAX_ITER = 30000                              # [B] 최대 탐색 반복 횟수
+_B_GOAL_XY = 0.6                                 # [B] 목표 위치 허용 오차 (m)
+_B_GOAL_YAW = math.radians(10)                   # [B] 목표 방향 허용 오차 (rad)
+
+
+class _HybridNode:  # [B] Hybrid A* 탐색 노드
+    """Hybrid A* 탐색 노드 (최소 힙 지원)."""
+
+    __slots__ = ('x', 'y', 'yaw', 'direction', 'g', 'f', 'parent')
+
+    def __init__(self, x, y, yaw, direction, g, f, parent=None):
+        self.x, self.y, self.yaw = x, y, yaw
+        self.direction = direction  # +1(전진) / -1(후진)
+        self.g, self.f = g, f
+        self.parent = parent
+
+    def __lt__(self, other):  # [B] 힙 비교
+        return self.f < other.f
+
+    def key(self):  # [B] 이산화된 상태 키 (방문 체크용)
+        return (
+            round(self.x / _B_XY_RES),
+            round(self.y / _B_XY_RES),
+            int(round(self.yaw / _B_YAW_RES)) % _B_N_YAW,
+            0 if self.direction > 0 else 1,
+        )
+# ===========================================================================
+# [B] 추가 영역 끝
+# ===========================================================================
+
+
 # [D] TODO [B] Hybrid A* — B 가 구현. (static_map, start_state, goal) -> 경로 리스트.
 #     경로의 각 점은 .x .y .yaw .direction(+1/-1) 을 가져야 함. 미완성 시 [] 반환.
-def hybrid_astar_plan(static_map, start_state, goal):  # [D] placeholder
-    return []
+def hybrid_astar_plan(static_map, start_state, goal):  # [B] Hybrid A* 구현
+    """비완전구동 차량용 Hybrid A* 경로 계획기.
+
+    반환: [[x, y, yaw, direction], ...] 웨이포인트 목록 (실패 시 [])
+    """
+    if not static_map or not start_state or goal is None:
+        return []
+
+    # [B] 맵 정보 파싱
+    extent = static_map.get("extent", [0, 10, 0, 10])
+    xmin, _, ymin, _ = [float(v) for v in extent]
+    cell = float(static_map.get("cellSize", _B_XY_RES))
+
+    grid_data = static_map.get("grid", {})
+    stat_layer = grid_data.get("stationary") or []
+    park_layer = grid_data.get("parked") or []
+    n_rows = len(stat_layer)
+    n_cols = len(stat_layer[0]) if n_rows > 0 else 0
+
+    # [B] 이진 장애물 flat 배열 (row-major, row=0 → ymin 방향)
+    occ = bytearray(n_rows * n_cols)
+    for r in range(n_rows):
+        row_s = stat_layer[r]
+        row_p = park_layer[r] if r < len(park_layer) else ()
+        for c in range(n_cols):
+            s = row_s[c] if c < len(row_s) else 0.0
+            p = row_p[c] if c < len(row_p) else 0.0
+            if s > 0.5 or p > 0.5:
+                occ[r * n_cols + c] = 1
+
+    def cell_occupied(x, y):
+        if n_rows == 0 or n_cols == 0:
+            return False  # 그리드 없으면 장애물 없음으로 처리
+        c_i = int((x - xmin) / cell)
+        r_i = int((y - ymin) / cell)
+        if not (0 <= r_i < n_rows and 0 <= c_i < n_cols):
+            return True  # 맵 밖 = 충돌로 처리
+        return occ[r_i * n_cols + c_i] != 0
+
+    hw = _B_VEH_WIDTH / 2
+
+    def collision_free(x, y, yaw):
+        """차량 footprint(종방향 5점 × 횡방향 3점)를 장애물 그리드에 체크."""
+        cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+        # 종방향: 후방(-P_LR) ~ 전방(P_LF), 0.5m 간격으로 5점
+        for lon in (-P_LR, -P_LR * 0.5, 0.0, P_LF * 0.5, P_LF):
+            bx = x + lon * cos_y
+            by = y + lon * sin_y
+            for lat in (-hw, 0.0, hw):  # 우측 / 중앙 / 좌측
+                if cell_occupied(bx - lat * sin_y, by + lat * cos_y):
+                    return False
+        return True
+
+    gx, gy, gyaw = goal
+
+    def heuristic(x, y, yaw):
+        dist = math.hypot(x - gx, y - gy)
+        dyaw = abs(_wrap_to_pi(yaw - gyaw))
+        return dist + dyaw * P_L * 0.3  # 방향 오차를 호 길이로 근사
+
+    # [B] 시작 노드 설정 및 탐색 초기화
+    sx = float(start_state['x'])
+    sy = float(start_state['y'])
+    syaw = float(start_state['yaw'])
+
+    start_node = _HybridNode(sx, sy, syaw, 1, 0.0, heuristic(sx, sy, syaw))
+    open_heap = [start_node]
+    best_g: Dict[tuple, float] = {}
+    result = None
+
+    for _ in range(_B_MAX_ITER):
+        if not open_heap:
+            break
+        cur = heapq.heappop(open_heap)
+        k = cur.key()
+        if k in best_g and best_g[k] <= cur.g:
+            continue
+        best_g[k] = cur.g
+
+        # [B] 목표 도달 확인
+        if (math.hypot(cur.x - gx, cur.y - gy) < _B_GOAL_XY
+                and abs(_wrap_to_pi(cur.yaw - gyaw)) < _B_GOAL_YAW):
+            result = cur
+            break
+
+        # [B] 노드 확장: 2방향 × 5조향각 = 10 후계 노드
+        for direction in (1, -1):
+            d = direction * _B_STEP
+            cusp = _B_CUSP_COST if direction != cur.direction else 0.0
+            for steer in _B_STEER_LIST:
+                nx = cur.x + d * math.cos(cur.yaw)
+                ny = cur.y + d * math.sin(cur.yaw)
+                nyaw = _wrap_to_pi(cur.yaw + d * math.tan(steer) / P_L)
+                if not collision_free(nx, ny, nyaw):
+                    continue
+                ng = cur.g + _B_STEP * (_B_REVERSE_COST if direction < 0 else 1.0) + cusp
+                child = _HybridNode(nx, ny, nyaw, direction, ng,
+                                    ng + heuristic(nx, ny, nyaw), cur)
+                ck = child.key()
+                if ck not in best_g or best_g[ck] > ng:
+                    heapq.heappush(open_heap, child)
+
+    if result is None:
+        print(f"[B] Hybrid A*: 경로 미발견 ({_B_MAX_ITER}회 탐색)")
+        return []
+
+    # [B] 경로 역추적 → [x, y, yaw, direction] 리스트 반환
+    path = []
+    node = result
+    while node is not None:
+        path.append([node.x, node.y, node.yaw, node.direction])
+        node = node.parent
+    path.reverse()
+    print(f"[B] Hybrid A*: 경로 발견 ({len(path)} 웨이포인트)")
+    return path
 
 
 # [D] TODO [C] Pure Pursuit — C 가 구현. (state, path, idx, direction) -> steer(rad).
@@ -197,6 +355,10 @@ class PlannerSkeleton:
     goal: Optional[Tuple[float, float, float]] = None  # [D] 목표 pose
     phase: str = "PLAN"                       # [D] PLAN -> DRIVE -> STOP
 
+    # [B] 맵 분석 결과
+    slots: Optional[List] = None       # [B] 전체 슬롯 목록
+    free_slots: Optional[List] = None  # [B] 빈 슬롯 목록
+
     def __post_init__(self) -> None:
         if self.waypoints is None:
             self.waypoints = []
@@ -205,6 +367,9 @@ class PlannerSkeleton:
         self.idx = 0
         self.goal = None
         self.phase = "PLAN"
+        # [B] B 상태 초기화
+        self.slots = []
+        self.free_slots = []
 
     def set_map(self, map_payload: Dict[str, Any]) -> None:
         """시뮬레이터에서 전송한 정적 맵 데이터를 보관합니다."""
@@ -224,6 +389,15 @@ class PlannerSkeleton:
         self.idx = 0
         self.goal = None
         self.phase = "PLAN"
+
+        # [B] 슬롯 파싱: 빈 슬롯 / 점유 슬롯 분류
+        self.slots = list(map_payload.get("slots", []))
+        occupied_idx = map_payload.get("occupied_idx", [])
+        self.free_slots = [
+            s for i, s in enumerate(self.slots)
+            if not (i < len(occupied_idx) and occupied_idx[i])
+        ]
+        print(f"[B] slots parsed: {len(self.slots)} total, {len(self.free_slots)} free")
 
     def compute_path(self, obs: Dict[str, Any]) -> None:
         """관측과 맵을 이용해 경로(웨이포인트)를 준비합니다."""
