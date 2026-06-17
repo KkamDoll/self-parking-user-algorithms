@@ -1081,7 +1081,12 @@ class PlannerSkeleton:
                         if not p:
                             return
                         cf = checkers.get(id(goal_c))
-                        key_p = (count_cusps(p), round(path_length(p), 1))
+                        # [I] pref=0 이면 스테이지 요구방향(cands[0]=expected_orientation pose).
+                        #     선택 키의 최상위에 둬, 검증 통과한 '요구방향' 경로를 (cusp/길이가 조금
+                        #     더 들더라도) 반대방향보다 우선 채택한다 → orientation 점수 확보.
+                        #     요구방향이 끝내 검증 실패면 pref=1(반대)이라도 채택(성공 우선).
+                        pref = 0 if goal_c is cands[0] else 1
+                        key_p = (pref, count_cusps(p), round(path_length(p), 1))
                         if fallback is None or key_p < fallback[0]:
                             fallback = (key_p, p, goal_c)   # 기하적으로 충돌없는 원본만 폴백에 사용
                         try:
@@ -1100,7 +1105,7 @@ class PlannerSkeleton:
                                 print(f"[H] 롤아웃 오류: {exc}")
                                 ok = False
                             if ok:
-                                key_v = (count_cusps(variant), round(path_length(variant), 1))
+                                key_v = (pref, count_cusps(variant), round(path_length(variant), 1))
                                 if verified is None or key_v < verified[0]:
                                     verified = (key_v, variant, goal_c)
 
